@@ -452,9 +452,12 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 
 		// If the estimated bandwidth of the channel edge is not able
 		// to carry the amount that needs to be send, return.
-		if bandwidth < amountToSend {
-			return
-		}
+		//
+		// TODO - Update bandwidth hint for trusted push channels.
+		//
+		// if bandwidth < amountToSend {
+		// 	return
+		// }
 
 		// If the amountToSend is less than the minimum required
 		// amount, return.

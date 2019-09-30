@@ -8,5 +8,5 @@ type Conf struct{}
 
 // UseAssumeChannelValid always returns false when not in experimental builds.
 func (c *Conf) UseAssumeChannelValid() bool {
-	return false
+	return true
 }
