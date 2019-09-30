@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/btcec"
@@ -336,6 +337,10 @@ type fundingConfig struct {
 	// incoming channels having a non-zero push amount.
 	RejectPush bool
 
+	// TrustedPush is set true if the fundingmanager allows incoming channels
+	// to be accepted with the FFZeroConfSpendablePush funding flag.
+	TrustedPush bool
+
 	// NotifyOpenChannelEvent informs the ChannelNotifier when channels
 	// transition from pending open to open.
 	NotifyOpenChannelEvent func(wire.OutPoint)
@@ -406,6 +411,8 @@ type fundingManager struct {
 
 	handleFundingLockedMtx      sync.RWMutex
 	handleFundingLockedBarriers map[lnwire.ChannelID]struct{}
+
+	sidCtr uint64 // To be used atomically.
 
 	quit chan struct{}
 	wg   sync.WaitGroup
@@ -501,6 +508,7 @@ func (f *fundingManager) start() error {
 		f.newChanBarriers[chanID] = make(chan struct{})
 		f.barrierMtx.Unlock()
 
+		// TODO(eugene) - Handle this restart case.
 		f.localDiscoverySignals[chanID] = make(chan struct{})
 
 		// Rebroadcast the funding transaction for any pending channel
@@ -733,6 +741,13 @@ func (f *fundingManager) stop() error {
 	f.wg.Wait()
 
 	return nil
+}
+
+// nextShortIDCounter increments the sidCtr for use in trusted push channels
+// since these channels don't have short channel id's properly assigned yet.
+func (f *fundingManager) nextShortIDCounter() uint64 {
+	ctr := atomic.AddUint64(&f.sidCtr, 1)
+	return ctr
 }
 
 // nextPendingChanID returns the next free pending channel ID to be used to
@@ -1060,6 +1075,17 @@ func (f *fundingManager) handleFundingOpen(fmsg *fundingOpenMsg) {
 		f.failFundingFlow(
 			fmsg.peer, fmsg.msg.PendingChannelID,
 			lnwallet.ErrNonZeroPushAmount())
+		return
+	}
+
+	// If the request specifies a trusted push channel and the flag is not
+	// enabled, signal an error.
+	trustedPushChan := (msg.ChannelFlags & lnwire.FFZeroConfSpendablePush) != 0
+	if !f.cfg.TrustedPush && trustedPushChan {
+		f.failFundingFlow(
+			fmsg.peer, fmsg.msg.PendingChannelID,
+			lnwallet.ErrZeroConfSpendablePushDisabled(),
+		)
 		return
 	}
 
@@ -1502,10 +1528,12 @@ func (f *fundingManager) handleFundingCreated(fmsg *fundingCreatedMsg) {
 
 	// Create an entry in the local discovery map so we can ensure that we
 	// process the channel confirmation fully before we receive a funding
-	// locked message.
-	f.localDiscoveryMtx.Lock()
-	f.localDiscoverySignals[channelID] = make(chan struct{})
-	f.localDiscoveryMtx.Unlock()
+	// locked message. We only do this if this is not a trusted push channel.
+	if completeChan.ChannelFlags&lnwire.FFZeroConfSpendablePush == 0 {
+		f.localDiscoveryMtx.Lock()
+		f.localDiscoverySignals[channelID] = make(chan struct{})
+		f.localDiscoveryMtx.Unlock()
+	}
 
 	// At this point we have sent our last funding message to the
 	// initiating peer before the funding transaction will be broadcast.
@@ -1566,6 +1594,26 @@ func (f *fundingManager) handleFundingCreated(fmsg *fundingCreatedMsg) {
 			return
 		}
 	}()
+
+	// If this is a trusted push channel, we send the funding locked message.
+	go func() {
+		// Create the lightning channel object that wraps the database state.
+		lnChannel, err := lnwallet.NewLightningChannel(
+			nil, completeChan, nil,
+		)
+		if err != nil {
+			fndgLog.Errorf("failed creating lnChannel: %v", err)
+			return
+		}
+
+		err = f.sendFundingLocked(
+			fmsg.peer, completeChan, lnChannel, nil,
+		)
+		if err != nil {
+			fndgLog.Errorf("failed sending fundingLocked: %v", err)
+			return
+		}
+	}()
 }
 
 // processFundingSigned sends a single funding sign complete message along with
@@ -1611,15 +1659,6 @@ func (f *fundingManager) handleFundingSigned(fmsg *fundingSignedMsg) {
 		return
 	}
 
-	// Create an entry in the local discovery map so we can ensure that we
-	// process the channel confirmation fully before we receive a funding
-	// locked message.
-	fundingPoint := resCtx.reservation.FundingOutpoint()
-	permChanID := lnwire.NewChanIDFromOutPoint(fundingPoint)
-	f.localDiscoveryMtx.Lock()
-	f.localDiscoverySignals[permChanID] = make(chan struct{})
-	f.localDiscoveryMtx.Unlock()
-
 	// The remote peer has responded with a signature for our commitment
 	// transaction. We'll verify the signature for validity, then commit
 	// the state to disk as we can now open the channel.
@@ -1632,6 +1671,17 @@ func (f *fundingManager) handleFundingSigned(fmsg *fundingSignedMsg) {
 			"complete: %v", err)
 		f.failFundingFlow(fmsg.peer, pendingChanID, err)
 		return
+	}
+
+	// Create an entry in the local discovery map so we can ensure that we
+	// process the channel confirmation fully before we receive a funding
+	// locked message. This is only done if this is not a trusted push channel.
+	fundingPoint := resCtx.reservation.FundingOutpoint()
+	permChanID := lnwire.NewChanIDFromOutPoint(fundingPoint)
+	if completeChan.ChannelFlags&lnwire.FFZeroConfSpendablePush == 0 {
+		f.localDiscoveryMtx.Lock()
+		f.localDiscoverySignals[permChanID] = make(chan struct{})
+		f.localDiscoveryMtx.Unlock()
 	}
 
 	// The channel is now marked IsPending in the database, and we can
@@ -1687,6 +1737,15 @@ func (f *fundingManager) handleFundingSigned(fmsg *fundingSignedMsg) {
 		return
 	}
 
+	// Create the lightning channel object that wraps the database state.
+	lnChannel, err := lnwallet.NewLightningChannel(
+		nil, completeChan, nil,
+	)
+	if err != nil {
+		fndgLog.Errorf("failed creating lnChannel: %v", err)
+		return
+	}
+
 	// At this point we have broadcast the funding transaction and done all
 	// necessary processing.
 	f.wg.Add(1)
@@ -1724,14 +1783,6 @@ func (f *fundingManager) handleFundingSigned(fmsg *fundingSignedMsg) {
 
 		// Go on adding the channel to the channel graph, and crafting
 		// channel announcements.
-		lnChannel, err := lnwallet.NewLightningChannel(
-			nil, completeChan, nil,
-		)
-		if err != nil {
-			fndgLog.Errorf("failed creating lnChannel: %v", err)
-			return
-		}
-
 		err = f.sendFundingLocked(
 			fmsg.peer, completeChan, lnChannel, shortChanID,
 		)
@@ -1776,6 +1827,17 @@ func (f *fundingManager) handleFundingSigned(fmsg *fundingSignedMsg) {
 		if err != nil {
 			fndgLog.Errorf("failed sending channel announcement: %v",
 				err)
+			return
+		}
+	}()
+
+	// If this is a trusted push channel, we send the funding locked message.
+	go func() {
+		err = f.sendFundingLocked(
+			fmsg.peer, completeChan, lnChannel, nil,
+		)
+		if err != nil {
+			fndgLog.Errorf("failed sending fundingLocked: %v", err)
 			return
 		}
 	}()
@@ -2129,11 +2191,13 @@ func (f *fundingManager) sendFundingLocked(peer lnpeer.Peer,
 	// moved to the next state of the state machine. It will be moved to the
 	// last state (actually deleted from the database) after the channel is
 	// finally announced.
-	err = f.saveChannelOpeningState(&completeChan.FundingOutpoint,
-		fundingLockedSent, shortChanID)
-	if err != nil {
-		return fmt.Errorf("error setting channel state to"+
-			" fundingLockedSent: %v", err)
+	if shortChanID != nil {
+		err = f.saveChannelOpeningState(&completeChan.FundingOutpoint,
+			fundingLockedSent, shortChanID)
+		if err != nil {
+			return fmt.Errorf("error setting channel state to"+
+				" fundingLockedSent: %v", err)
+		}
 	}
 
 	return nil
@@ -2218,11 +2282,13 @@ func (f *fundingManager) addToRouterGraph(completeChan *channeldb.OpenChannel,
 	// channel is moved to the next state of the state machine. It will be
 	// moved to the last state (actually deleted from the database) after
 	// the channel is finally announced.
-	err = f.saveChannelOpeningState(&completeChan.FundingOutpoint,
-		addedToRouterGraph, shortChanID)
-	if err != nil {
-		return fmt.Errorf("error setting channel state to"+
-			" addedToRouterGraph: %v", err)
+	if shortChanID != nil {
+		err = f.saveChannelOpeningState(&completeChan.FundingOutpoint,
+			addedToRouterGraph, shortChanID)
+		if err != nil {
+			return fmt.Errorf("error setting channel state to"+
+				" addedToRouterGraph: %v", err)
+		}
 	}
 
 	return nil
@@ -2489,6 +2555,48 @@ func (f *fundingManager) handleFundingLocked(fmsg *fundingLockedMsg) {
 		}
 		f.barrierMtx.Unlock()
 	}()
+
+	// If this is a trusted push channel, set the temporary short channel id
+	// which will be used until the funding tx is confirmed.
+	if channel.ChannelFlags&lnwire.FFZeroConfSpendablePush != 0 {
+		// TODO - Set a limit to trusted push channels per peer? This is currently
+		// vulnerable to somebody taking up all of the ShortChannelIDs.
+		ctr := f.nextShortIDCounter()
+		// channel.ShortChannelID = lnwire.NewShortChanIDFromInt(math.MaxUint64 - ctr)
+		channel.ShortChannelID = lnwire.NewShortChanIDFromInt(ctr)
+		channel.Packager = channeldb.NewChannelPackager(channel.ShortChannelID)
+
+		// Must add the channel to the router graph (assume valid) and send a
+		// node announcement so that pathfinding works.
+		err = f.addToRouterGraph(channel, &channel.ShortChannelID)
+		if err != nil {
+			fndgLog.Infof("Failed adding trusted push chan: %v to router graph: %v",
+				channel.ShortChannelID, err)
+			return
+		}
+
+		nodeAnn, err := f.cfg.CurrentNodeAnnouncement()
+		if err != nil {
+			fndgLog.Errorf("can't generate node announcement: %v", err)
+			return
+		}
+
+		errChan := f.cfg.SendAnnouncement(&nodeAnn)
+		select {
+		case err := <-errChan:
+			if err != nil {
+				if routing.IsError(err, routing.ErrOutdated, routing.ErrIgnored) {
+					fndgLog.Debugf("Router rejected NodeAnnouncement: %v", err)
+				} else {
+					fndgLog.Errorf("Unable to send NodeAnnouncement: %v", err)
+					return
+				}
+			}
+
+		case <-f.quit:
+			return
+		}
+	}
 
 	if err := fmsg.peer.AddNewChannel(channel, f.quit); err != nil {
 		fndgLog.Errorf("Unable to add new channel %v with peer %x: %v",
@@ -2779,6 +2887,12 @@ func (f *fundingManager) handleInitFundingMsg(msg *initFundingMsg) {
 	if !msg.openChanReq.private {
 		// This channel will be announced.
 		channelFlags = lnwire.FFAnnounceChannel
+	}
+
+	if msg.openChanReq.trustedPush {
+		// This channel will allow the counterparty to spend pushed funds while
+		// the funding tx is unconfirmed.
+		channelFlags |= lnwire.FFZeroConfSpendablePush
 	}
 
 	// Initialize a funding reservation with the local wallet. If the
