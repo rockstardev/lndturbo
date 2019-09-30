@@ -1060,6 +1060,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB,
 		MinChanSize:            btcutil.Amount(cfg.MinChanSize),
 		MaxPendingChannels:     cfg.MaxPendingChannels,
 		RejectPush:             cfg.RejectPush,
+		TrustedPush:            cfg.TrustedPush,
 		NotifyOpenChannelEvent: s.channelNotifier.NotifyOpenChannelEvent,
 	})
 	if err != nil {
@@ -3026,6 +3027,8 @@ type openChanReq struct {
 	// minConfs indicates the minimum number of confirmations that each
 	// output selected to fund the channel should satisfy.
 	minConfs int32
+
+	trustedPush bool
 
 	// TODO(roasbeef): add ability to specify channel constraints as well
 

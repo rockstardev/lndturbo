@@ -656,6 +656,12 @@ var openChannelCommand = cli.Command{
 				"transaction must satisfy",
 			Value: 1,
 		},
+		cli.BoolFlag{
+			Name: "trusted_push",
+			Usage: "(optional) whether this channel allows the pushed amount " +
+				"to be spent before reaching the required number of " +
+				"confirmations",
+		},
 	},
 	Action: actionDecorator(openChannel),
 }
@@ -750,6 +756,8 @@ func openChannel(ctx *cli.Context) error {
 	}
 
 	req.Private = ctx.Bool("private")
+
+	req.TrustedPush = ctx.Bool("trusted_push")
 
 	stream, err := client.OpenChannel(ctxb, req)
 	if err != nil {

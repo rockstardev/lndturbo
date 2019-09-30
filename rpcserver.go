@@ -1476,6 +1476,7 @@ func (r *rpcServer) OpenChannel(in *lnrpc.OpenChannelRequest,
 		private:         in.Private,
 		remoteCsvDelay:  remoteCsvDelay,
 		minConfs:        minConfs,
+		trustedPush:     in.TrustedPush,
 	}
 
 	updateChan, errChan := r.server.OpenChannel(req)
@@ -1619,6 +1620,7 @@ func (r *rpcServer) OpenChannelSync(ctx context.Context,
 		private:         in.Private,
 		remoteCsvDelay:  remoteCsvDelay,
 		minConfs:        minConfs,
+		trustedPush:     in.TrustedPush,
 	}
 
 	updateChan, errChan := r.server.OpenChannel(req)
