@@ -2127,7 +2127,11 @@ func (s *Switch) UpdateShortChanID(chanID lnwire.ChannelID) error {
 	// exists, then we will ignore the request.
 	link, ok := s.pendingLinkIndex[chanID]
 	if !ok {
-		return fmt.Errorf("link %v not found", chanID)
+		// TODO - Only check this for trusted push channels.
+		link, ok = s.linkIndex[chanID]
+		if !ok {
+			return fmt.Errorf("link %v not found", chanID)
+		}
 	}
 
 	oldShortChanID := link.ShortChanID()

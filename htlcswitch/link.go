@@ -1559,6 +1559,19 @@ func (l *channelLink) handleUpstreamMsg(msg lnwire.Message) {
 		// We just received an add request from an upstream peer, so we
 		// add it to our state machine, then add the HTLC to our
 		// "settle" list in the event that we know the preimage.
+
+		// If this channel is a turbo channel, fail the link if the channel
+		// is pending and the update came from the initiator.
+		chanFlags := l.channel.State().ChannelFlags
+		isPending := l.channel.IsPending()
+		isInitiator := l.channel.IsInitiator()
+
+		if chanFlags&lnwire.FFZeroConfSpendablePush != 0 && isPending && !isInitiator {
+			l.fail(LinkFailureError{code: ErrInvalidUpdate},
+				"unable to handle upstream add HTLC")
+			return
+		}
+
 		index, err := l.channel.ReceiveHTLC(msg)
 		if err != nil {
 			l.fail(LinkFailureError{code: ErrInvalidUpdate},
@@ -2043,11 +2056,23 @@ func (l *channelLink) UpdateShortChanID() (lnwire.ShortChannelID, error) {
 	// Refresh the channel state's short channel ID by loading it from disk.
 	// This ensures that the channel state accurately reflects the updated
 	// short channel ID.
-	err := l.channel.State().RefreshShortChanID()
-	if err != nil {
-		l.errorf("unable to refresh short_chan_id for chan_id=%v: %v",
-			chanID, err)
-		return hop.Source, err
+	//
+	// If this is a turbo channel, then refresh the IsPending state.
+	chanFlags := l.channel.State().ChannelFlags
+	if chanFlags&lnwire.FFZeroConfSpendablePush != 0 {
+		err := l.channel.State().RefreshTrustedID()
+		if err != nil {
+			l.errorf("unable to refresh short_chan_id for turbo chan=%v: %v",
+				chanID, err)
+			return l.shortChanID, err
+		}
+	} else {
+		err := l.channel.State().RefreshShortChanID()
+		if err != nil {
+			l.errorf("unable to refresh short_chan_id for chan_id=%v: %v",
+				chanID, err)
+			return hop.Source, err
+		}
 	}
 
 	sid := l.channel.ShortChanID()
