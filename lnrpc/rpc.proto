@@ -1443,6 +1443,9 @@ message OpenChannelRequest {
 
     /// Whether unconfirmed outputs should be used as inputs for the funding transaction.
     bool spend_unconfirmed = 12 [json_name = "spend_unconfirmed"];
+
+    /// Whether this channel lets the push amount to be spent while unconfirmed.
+    bool trusted_push = 13 [json_name = "trusted_push"];
 }
 message OpenStatusUpdate {
     oneof update {

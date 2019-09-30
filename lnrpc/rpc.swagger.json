@@ -2854,6 +2854,11 @@
           "type": "boolean",
           "format": "boolean",
           "description": "/ Whether unconfirmed outputs should be used as inputs for the funding transaction."
+        },
+        "trusted_push": {
+          "type": "boolean",
+          "format": "boolean",
+          "description": "/ Whether this channel lets the push amount to be spent while unconfirmed."
         }
       }
     },
