@@ -606,6 +606,46 @@ func (c *OpenChannel) RefreshShortChanID() error {
 	return nil
 }
 
+// RefreshTrustedID updates the in-memory short channel ID using the latest
+// value observed on disk. It also updates the IsPending state and does not
+// create a new channel packager.
+func (c *OpenChannel) RefreshTrustedID() error {
+	c.Lock()
+	defer c.Unlock()
+
+	var sid lnwire.ShortChannelID
+	var pending bool
+	err := c.Db.View(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
+		if err != nil {
+			return err
+		}
+
+		pending = channel.IsPending
+		sid = channel.ShortChannelID
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	c.IsPending = pending
+	c.ShortChannelID = sid
+
+	// TODO - Check safety of this if there are in-flight htlc's with the old id?
+	c.Packager = NewChannelPackager(sid)
+
+	return nil
+}
+
 // fetchChanBucket is a helper function that returns the bucket where a
 // channel's data resides in given: the public key for the node, the outpoint,
 // and the chainhash that the channel resides on.
